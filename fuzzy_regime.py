@@ -1,19 +1,10 @@
 """
-fuzzy_regime.py — Continuous regime via triangular membership on ADX.
-===================================================================
-Breaks the 24↔26 ADX cliff. Provides blended params.
+fuzzy_regime.py — v8.2.0. Fixed: m_t start 20→25 so TRANSITION peaks ~23 not 27.
 """
 from __future__ import annotations
 
 from typing import Dict, Tuple
 
-# ADX breakpoints
-_ADX_RANGING_HIGH = 22.0
-_ADX_TRANSITION_LOW = 20.0
-_ADX_TRANSITION_HIGH = 27.0
-_ADX_TRENDING_LOW = 25.0
-
-# Map fuzzy label → optimizer regime key
 TRANSITION_MAP = {"TRANSITION": "WEAK_TREND"}
 
 
@@ -26,13 +17,11 @@ def _tri(x: float, a: float, b: float, c: float) -> float:
 
 
 def membership(adx_value: float) -> Dict[str, float]:
-    """Return {RANGING, TRANSITION, TRENDING} summing to ~1.0."""
-    m_r = _tri(adx_value, 0.0, 15.0, _ADX_RANGING_HIGH + 5)
-    m_t = _tri(adx_value, _ADX_TRENDING_LOW - 5, 40.0, 60.0)
-    raw = {
-        "RANGING": max(m_r, 0.0),
-        "TRENDING": max(m_t, 0.0),
-    }
+    # RANGING peaks at 15, ends at 27
+    m_r = _tri(adx_value, 0.0, 15.0, 27.0)
+    # TRENDING peaks at 40, ends at 60 — start at 25 (was 20)
+    m_t = _tri(adx_value, 25.0, 40.0, 60.0)
+    raw = {"RANGING": max(m_r, 0.0), "TRENDING": max(m_t, 0.0)}
     s = sum(raw.values())
     if s > 1.0:
         for k in raw:
@@ -49,21 +38,14 @@ def dominant(weights: Dict[str, float]) -> str:
     return max(weights, key=weights.get)
 
 
-def blend_params(
-    weights: Dict[str, float],
-    per_regime: Dict[str, Dict[str, float]],
-    keys: Tuple[str, ...] = ("threshold", "sl_mult", "tp1_mult", "tp2_mult", "max_hold"),
-) -> Dict[str, float]:
-    """
-    Weighted blend of numeric params.
-    Maps fuzzy 'TRANSITION' → optimizer 'WEAK_TREND' for lookup.
-    """
+def blend_params(weights: Dict[str, float],
+                 per_regime: Dict[str, Dict[str, float]],
+                 keys: Tuple[str, ...] = ("threshold", "sl_mult", "tp1_mult", "tp2_mult", "max_hold")
+                 ) -> Dict[str, float]:
     out: Dict[str, float] = {}
     fallback = next(iter(per_regime.values()), {})
-
     for k in keys:
-        num = 0.0
-        den = 0.0
+        num, den = 0.0, 0.0
         for r, w in weights.items():
             if w <= 0:
                 continue
