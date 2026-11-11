@@ -1,0 +1,99 @@
+name: XAUUSD Signal Bot v8.1
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: xauusd-signal
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir --quiet -r requirements.txt
+
+      - name: Verify required files
+        run: |
+          MISSING=""
+          for f in bot.py optimizer.py news_calendar.py fuzzy_regime.py \
+                   kelly.py supabase_client.py requirements.txt; do
+            if [ ! -f "$f" ]; then
+              echo "❌ MISSING: $f"; MISSING="$MISSING $f"
+            else
+              echo "✅ $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then echo "❌ MISSING:$MISSING"; exit 1; fi
+
+      - name: Verify imports
+        run: |
+          python -c "
+          import sys
+          try:
+              from bot import main, is_holiday, is_market_open, VERSION
+              from news_calendar import NewsResult, check_news_guard
+              from fuzzy_regime import membership, blend_params, dominant
+              from kelly import kelly_fraction, risk_pct_from_env
+              from supabase_client import SUPABASE, try_insert_signal
+              print(f'✅ imports OK v{VERSION} | Supabase={SUPABASE.enabled}')
+          except Exception as e:
+              print(f'❌ {type(e).__name__}: {e}'); sys.exit(1)
+          "
+
+      - name: Restore persistent cache (SQLite + news + params)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/quant_audit.db
+            data/news_cache.json
+            params.json
+          key: bot-cache-${{ github.run_id }}
+          restore-keys: |
+            bot-cache-
+
+      - name: Run signal bot
+        env:
+          TWELVE_DATA_API_KEY:  ${{ secrets.TWELVE_DATA_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:         ${{ secrets.SUPABASE_KEY }}
+          ACCOUNT_SIZE_USD:     ${{ vars.ACCOUNT_SIZE_USD || '10000' }}
+          XAUUSD_CONTRACT_SIZE: ${{ vars.XAUUSD_CONTRACT_SIZE || '100' }}
+          RISK_PCT:             ${{ vars.RISK_PCT || '1.0' }}
+          KELLY_FRACTION:       ${{ vars.KELLY_FRACTION || '0.5' }}
+          KELLY_CAP_PCT:        ${{ vars.KELLY_CAP_PCT || '3.0' }}
+          DAILY_DD_LIMIT_R:     ${{ vars.DAILY_DD_LIMIT_R || '3.0' }}
+          DAILY_DD_DERISK_R:    ${{ vars.DAILY_DD_DERISK_R || '2.0' }}
+          DAILY_DD_DERISK_MULT: ${{ vars.DAILY_DD_DERISK_MULT || '0.5' }}
+          CB_HALT_CONSECUTIVE:  ${{ vars.CB_HALT_CONSECUTIVE || '5' }}
+          MAX_DAILY_SIGNALS:    ${{ vars.MAX_DAILY_SIGNALS || '10' }}
+          NEWS_ENABLED:         ${{ vars.NEWS_ENABLED || '1' }}
+        run: python bot.py
+
+      - name: Save persistent cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/quant_audit.db
+            data/news_cache.json
+            params.json
+          key: bot-cache-${{ github.run_id }}
