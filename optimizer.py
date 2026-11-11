@@ -1,20 +1,8 @@
 """
-optimizer.py — v8.0.0 Fuzzy-Regime Walk-Forward Optimizer.
-=========================================================
-Fixes over v7:
-  [P1] simulate(): TP1-first priority (matches v8 outcome tracker, no overstate)
-  [P1] main(): save params.json ONLY if all pre-live gates pass
-  [P2] _init_params(): regime-specific defaults (not flat)
-  [P2] gate_passed flag in params.json for auditing
-
-Usage:
-    python optimizer.py                    # default 2y, 4 folds
-    python optimizer.py --period 3y --folds 5 --min-train 500
-
-Exit codes:
-    0 = gates passed, params.json written
-    1 = data error / insufficient bars
-    2 = gates FAILED, params.json NOT written (bot will use builtin)
+optimizer.py — v8.2.1 Walk-Forward Optimizer.
+=============================================
+Changelog v8.2.1:
+  [FIX] fetch_long_history(): volume column guard (no crash on missing volume)
 """
 from __future__ import annotations
 
@@ -36,7 +24,6 @@ from kelly import kelly_fraction
 LOG = get_logger("xauusd_optimizer")
 CRISP_REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
-# Regime-specific defaults (matches bot.py DEFAULT_PER_REGIME_PARAMS)
 _INIT_PER_REGIME: Dict[str, Dict[str, float]] = {
     "TRENDING":   {"threshold": 65.0, "sl_mult": 1.5, "tp1_mult": 2.0, "tp2_mult": 3.0, "max_hold": 72},
     "WEAK_TREND": {"threshold": 70.0, "sl_mult": 1.5, "tp1_mult": 1.5, "tp2_mult": 2.5, "max_hold": 48},
@@ -56,11 +43,15 @@ def fetch_long_history(period: str = "2y") -> pd.DataFrame:
     tcol = "Datetime" if "Datetime" in raw.columns else (
         "Date" if "Date" in raw.columns else raw.columns[0])
     df = raw.rename(columns={tcol: "time", "Open": "open", "High": "high",
-                             "Low": "low", "Close": "close", "Volume": "volume"})
+                              "Low": "low", "Close": "close", "Volume": "volume"})
     df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
     for c in ["open", "high", "low", "close"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+    # [v8.2.1 FIX] guard volume
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+    else:
+        df["volume"] = 1000.0
     df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
     log_event(event="data_loaded", bars=len(df),
               start=str(df["time"].iloc[0]), end=str(df["time"].iloc[-1]))
@@ -175,7 +166,7 @@ def apply_signals(pre: pd.DataFrame, params: Dict[str, Dict[str, float]]) -> np.
 
 
 # ============================================================================
-# SIMULATE  (CONSERVATIVE: SL → TP1 → TP2, aligns with v8 outcome tracker)
+# SIMULATE
 # ============================================================================
 def simulate(pre: pd.DataFrame, signal: np.ndarray,
              params: Dict[str, Dict[str, float]]) -> pd.DataFrame:
@@ -201,7 +192,6 @@ def simulate(pre: pd.DataFrame, signal: np.ndarray,
             sl, tp1, tp2 = entry + sl_d, entry - sl_d * tp1_m, entry - sl_d * tp2_m
         et, R, bars = "TIME", 0.0, mh
         for j in range(i + 1, min(i + 1 + mh, n)):
-            # CONSERVATIVE: SL first (worst-case), then TP1, then TP2
             if d == "BUY":
                 if lows[j] <= sl:
                     et, R, bars = "SL", -1.0, j - i
