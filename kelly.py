@@ -1,8 +1,6 @@
 """
-kelly.py — Fractional Kelly position sizing.
-==========================================
-Formula: f* = (p*b - q) / b,  b = avg_win / avg_loss
-Half-Kelly default. Hard cap 3% account. Fallback 1% jika data < 20 trade.
+kelly.py — v8.2.0 Bayesian-shrunk fractional Kelly.
+MIN_TRADES raised 20 → 50. Beta(5,5) prior on win-rate.
 """
 from __future__ import annotations
 
@@ -10,8 +8,10 @@ import logging
 import os
 from typing import List, Optional, Tuple
 
-MIN_TRADES_FOR_KELLY = 20
+MIN_TRADES_FOR_KELLY = 50
 DEFAULT_RISK_PCT = 1.0
+BAYES_ALPHA = 5.0
+BAYES_BETA = 5.0
 
 
 def _log(level: int, msg: str, **kw) -> None:
@@ -21,45 +21,39 @@ def _log(level: int, msg: str, **kw) -> None:
     lg.handle(rec)
 
 
-def kelly_stats(R: List[float]) -> Optional[Tuple[float, float, float, int]]:
-    """Return (win_rate, avg_win, avg_loss, n) or None."""
+def kelly_fraction(R: List[float], fraction: float = 0.5, cap_pct: float = 3.0) -> Tuple[float, str]:
     n = len(R)
     if n < MIN_TRADES_FOR_KELLY:
-        return None
+        return DEFAULT_RISK_PCT, f"fallback {DEFAULT_RISK_PCT}% (n={n}<{MIN_TRADES_FOR_KELLY})"
+
     wins = [x for x in R if x > 0]
     losses = [abs(x) for x in R if x < 0]
     if not wins or not losses:
-        return None
-    p = len(wins) / n
+        return DEFAULT_RISK_PCT, f"fallback (no wins or no losses, n={n})"
+
+    # Bayesian shrinkage
+    p_raw = len(wins) / n
+    p_bayes = (len(wins) + BAYES_ALPHA) / (n + BAYES_ALPHA + BAYES_BETA)
+
     avg_win = sum(wins) / len(wins)
     avg_loss = sum(losses) / len(losses)
     if avg_loss <= 0:
-        return None
-    return p, avg_win, avg_loss, n
+        return DEFAULT_RISK_PCT, "fallback (avg_loss<=0)"
 
-
-def kelly_fraction(R: List[float], fraction: float = 0.5, cap_pct: float = 3.0) -> Tuple[float, str]:
-    """Return (risk_pct, reason)."""
-    st = kelly_stats(R)
-    if st is None:
-        n = len(R)
-        return DEFAULT_RISK_PCT, f"fallback {DEFAULT_RISK_PCT}% (n={n}<{MIN_TRADES_FOR_KELLY})"
-
-    p, avg_win, avg_loss, n = st
     b = avg_win / avg_loss
-    q = 1.0 - p
-    f_full = (p * b - q) / b
+    f_full = (p_bayes * b - (1.0 - p_bayes)) / b
     f_frac = max(f_full * fraction, 0.0) * 100.0
     capped = min(f_frac, cap_pct)
-    reason = (f"kelly p={p:.3f} b={b:.2f} full={f_full*100:.2f}% "
-              f"×{fraction}={f_frac:.2f}% cap={cap_pct}% n={n}")
-    _log(logging.INFO, "kelly_computed", p=p, b=b, f_full=f_full,
-         f_frac=f_frac / 100.0, n=n)
+
+    reason = (f"kelly_bayes p={p_bayes:.3f} (raw={p_raw:.3f}) "
+              f"b={b:.2f} full={f_full*100:.2f}% ×{fraction}={f_frac:.2f}% "
+              f"cap={cap_pct}% n={n}")
+    _log(logging.INFO, "kelly_computed", p_bayes=p_bayes, p_raw=p_raw,
+         b=b, f_full=f_full, f_frac=f_frac/100.0, n=n)
     return round(capped, 2), reason
 
 
 def risk_pct_from_env() -> Tuple[float, float]:
-    """Return (fraction, cap)."""
     return (
         float(os.getenv("KELLY_FRACTION", "0.5")),
         float(os.getenv("KELLY_CAP_PCT", "3.0")),
