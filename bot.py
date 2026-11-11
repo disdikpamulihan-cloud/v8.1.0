@@ -1,11 +1,17 @@
 """
-XAUUSD Quantitative Signal Bot — v8.2.1 PRODUCTION HARDENED
-============================================================
-Changelog v8.2.1 (surgical fix):
-  [FIX] MarketDataHandler._twelve/_yf/_csv: volume column guard
-        (Twelve Data XAU/USD forex has NO volume field → previous
-        `df.get("volume", 1000.0).fillna(...)` crashed on float scalar)
-  [FIX] _maybe_heartbeat(): accept source param (no more '?')
+XAUUSD Quantitative Signal Bot — v8.2.2 PRODUCTION PERFECT
+===========================================================
+Changelog v8.2.2 (signal quality):
+  [Q] _run_21_voters(): synthetic-volume detection. Twelve Data XAU/USD
+      forex has no real volume → previously volume-voter always voted -1
+      (systematic bearish bias). Now substitutes VWAP-proxy (typical-price
+      SMA20) when synthetic detected → unbiased, legitimate TA signal.
+  [Q] Expose volume_synthetic flag in voters_debug + signal_emitted log
+      for full transparency.
+
+Verified unchanged: all v8.2.1 features (TD primary, M15 real,
+paper/live modes, $+R drawdown halt, exposure caps, confirmation
+workflow, heartbeat, Bayesian Kelly, fuzzy calibration).
 """
 from __future__ import annotations
 
@@ -45,7 +51,7 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "8.2.1"
+VERSION = "8.2.2"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
@@ -465,7 +471,7 @@ class MarketDataHandler:
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        # [v8.2.1 FIX] XAU/USD forex has NO volume field
+        # [v8.2.1] XAU/USD forex has NO volume field — guard
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
         else:
@@ -490,7 +496,6 @@ class MarketDataHandler:
             d["time"] = pd.to_datetime(d["time"], utc=True).dt.tz_localize(None)
             for c in ["open", "high", "low", "close"]:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
-            # [v8.2.1 FIX] guard volume
             if "volume" in d.columns:
                 d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(1000.0)
             else:
@@ -517,7 +522,6 @@ class MarketDataHandler:
         df["time"] = pd.to_datetime(df[tcol], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        # [v8.2.1 FIX] guard volume
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
         else:
@@ -668,7 +672,7 @@ def check_macro_correlation(cfg: BotConfig) -> Tuple[bool, str]:
 
 
 # ============================================================================
-# 10. SIGNAL GENERATOR
+# 10. SIGNAL GENERATOR  (v8.2.2: synthetic-volume aware)
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -711,6 +715,11 @@ class SignalGenerator:
         v: List[int] = []
         dbg: Dict[str, int] = {}
 
+        # [v8.2.2] Detect synthetic volume (TD XAU/USD forex has no volume field)
+        vol_is_synthetic = bool(df["volume"].nunique() <= 1)
+        dbg["volume_synthetic"] = 1 if vol_is_synthetic else 0
+
+        # --- 6 trend votes ---
         sma_votes = [1 if c > sma(close, 50).iloc[-1] else -1,
                      1 if c > sma(close, 200).iloc[-1] else -1]
         e9 = ema(close, 9); e21 = ema(close, 21)
@@ -724,12 +733,14 @@ class SignalGenerator:
         v.extend(sma_votes + pad)
         dbg["trend"] = sum(sma_votes + pad)
 
+        # --- 3 EMA votes ---
         e1 = 1 if ema(close, 9).iloc[-1] > ema(close, 21).iloc[-1] else -1
         e2 = 1 if ema(close, 12).iloc[-1] > ema(close, 26).iloc[-1] else -1
         e3 = 1 if ema(close, 50).iloc[-1] > ema(close, 200).iloc[-1] else -1
         v.extend([e1, e2, e3])
         dbg["ema"] = e1 + e2 + e3
 
+        # --- 3 RSI votes (symmetric) ---
         r = float(rsi(close, 14).iloc[-1])
         r_v = [
             1 if r > 55 else (-1 if r < 45 else 0),
@@ -739,6 +750,7 @@ class SignalGenerator:
         v.extend(r_v)
         dbg["rsi"] = sum(r_v)
 
+        # --- 5 momentum votes ---
         adx_v, p_di, m_di = adx(df, 14)
         m_v = [
             1 if p_di.iloc[-1] > m_di.iloc[-1] else -1,
@@ -750,6 +762,7 @@ class SignalGenerator:
         v.extend(m_v)
         dbg["momentum"] = sum(m_v)
 
+        # --- 2 micro votes ---
         mp = 0
         for n in (5, 10):
             hi_n, lo_n = df["high"].iloc[-n:].max(), df["low"].iloc[-n:].min()
@@ -759,11 +772,24 @@ class SignalGenerator:
             mp += vote
         dbg["micro"] = mp
 
-        vol_ma = df["volume"].rolling(20).mean().iloc[-1]
-        vol_v = 1 if (not pd.isna(vol_ma) and df["volume"].iloc[-1] > vol_ma) else -1
+        # --- 1 volume vote ---
+        # [v8.2.2] Synthetic → VWAP proxy (typical-price SMA20). Real → volume MA.
+        # This is the critical fix: previous code voted -1 every run when
+        # synthetic because 1000.0 > mean(1000.0) is always False.
+        if vol_is_synthetic:
+            typical = (df["high"] + df["low"] + df["close"]) / 3.0
+            vwap_proxy = float(typical.rolling(20).mean().iloc[-1])
+            vol_v = 1 if c > vwap_proxy else -1
+        else:
+            vol_ma = df["volume"].rolling(20).mean().iloc[-1]
+            vol_v = 1 if (not pd.isna(vol_ma) and df["volume"].iloc[-1] > vol_ma) else -1
         v.append(vol_v)
         dbg["volume"] = vol_v
 
+        # --- 1 POC vote ---
+        # POC is computed regardless. With synthetic volume the POC reduces to
+        # the price-mode (most-common close zone) — still a valid "value area"
+        # concept even without real volume.
         poc = volume_profile_poc(df)
         poc_v = 1 if c > poc else -1
         v.append(poc_v)
@@ -1634,7 +1660,8 @@ class TradingBotOrchestrator:
                       regime=e.regime, kelly_base=kelly_base, kelly_final=kelly_final,
                       cb=cb_r, dd=dd_r, mult=mult, signal_id=signal_id, tg=sent,
                       n_today=n_today, mode=self.cfg.trading_mode,
-                      td_remaining=self.data.td_remaining)
+                      td_remaining=self.data.td_remaining,
+                      volume_synthetic=e.voters_debug.get("volume_synthetic", 0))
             print(f"ACTION: {e.action} | Score: {e.total_score}% | "
                   f"Regime: {e.regime} | Kelly: {kelly_final:.2f}% (×{mult}) | "
                   f"Spot: {tradable:.2f} | TG: {sent} | CB: {cb_r} | DD: {dd_r} | "
