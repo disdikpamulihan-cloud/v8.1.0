@@ -1,18 +1,11 @@
 """
-XAUUSD Quantitative Signal Bot — v8.2.0 PRODUCTION HARDENED
+XAUUSD Quantitative Signal Bot — v8.2.1 PRODUCTION HARDENED
 ============================================================
-Signal-only (manual MT5). Additions vs v8.1.0:
-  [C2] confirmed flag + trading_mode (paper|live) — Kelly fed only by confirmed
-  [C3] $ drawdown tracking + halt (not just R-sum)
-  [C4] max concurrent per direction + max total open risk $
-  [C5] actual fill confirmation workflow (see confirm.py)
-  [H1] RSI voter symmetry fix
-  [H3] Kelly Bayesian shrinkage (delegated to kelly.py)
-  [H5] Twelve Data quota monitoring
-  [H6] Fuzzy calibration fix (delegated to fuzzy_regime.py)
-  [M2] Hard config validation in __post_init__
-  [M3] Daily heartbeat
-  [C1] params.json runtime guard (refuse unless ALLOW_UNADJUSTED_PARAMS=1)
+Changelog v8.2.1 (surgical fix):
+  [FIX] MarketDataHandler._twelve/_yf/_csv: volume column guard
+        (Twelve Data XAU/USD forex has NO volume field → previous
+        `df.get("volume", 1000.0).fillna(...)` crashed on float scalar)
+  [FIX] _maybe_heartbeat(): accept source param (no more '?')
 """
 from __future__ import annotations
 
@@ -52,13 +45,13 @@ from kelly import kelly_fraction, risk_pct_from_env
 from news_calendar import NewsResult, check_news_guard as _live_news_guard
 from supabase_client import SUPABASE, try_insert_signal
 
-VERSION = "8.2.0"
+VERSION = "8.2.1"
 RUN_ID = uuid.uuid4().hex[:8]
 REGIMES = ("TRENDING", "WEAK_TREND", "RANGING")
 
 
 # ============================================================================
-# 1. CONFIG (validated)
+# 1. CONFIG
 # ============================================================================
 @dataclass
 class BotConfig:
@@ -78,7 +71,7 @@ class BotConfig:
     notify_wait: bool = False
     max_daily_signals: int = 10
 
-    trading_mode: str = "paper"                    # paper | live
+    trading_mode: str = "paper"
     auto_confirm_hours: int = 4
     max_concurrent_per_direction: int = 2
     max_total_open_risk_pct: float = 3.0
@@ -354,7 +347,7 @@ def validate_ohlcv(df: pd.DataFrame, min_bars: int, label: str, allow_gap: bool 
 
 
 # ============================================================================
-# 6. PARAMS (with mismatch guard)
+# 6. PARAMS
 # ============================================================================
 DEFAULT_PER_REGIME_PARAMS: Dict[str, Dict[str, float]] = {
     "TRENDING":   {"threshold": 65.0, "sl_mult": 1.5, "tp1_mult": 2.0, "tp2_mult": 3.0, "max_hold": 72.0},
@@ -387,7 +380,6 @@ def load_params(cfg: BotConfig) -> Tuple[Dict[str, Dict[str, float]], str]:
     if not os.path.exists(path):
         return builtin, "builtin"
     if not cfg.allow_unadjusted_params:
-        # [C1] optimizer not aligned with live fuzzy logic → refuse to use
         log_event(logging.WARNING, "params_refused",
                   reason="optimizer uses crisp regime, live uses fuzzy — "
                          "set ALLOW_UNADJUSTED_PARAMS=1 to override")
@@ -473,7 +465,11 @@ class MarketDataHandler:
         df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+        # [v8.2.1 FIX] XAU/USD forex has NO volume field
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+        else:
+            df["volume"] = 1000.0
         return df.sort_values("time").reset_index(drop=True)
 
     def _yf(self) -> MarketData:
@@ -494,7 +490,11 @@ class MarketDataHandler:
             d["time"] = pd.to_datetime(d["time"], utc=True).dt.tz_localize(None)
             for c in ["open", "high", "low", "close"]:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
-            d["volume"] = pd.to_numeric(d.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+            # [v8.2.1 FIX] guard volume
+            if "volume" in d.columns:
+                d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(1000.0)
+            else:
+                d["volume"] = 1000.0
             return d.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
 
         h1 = norm(h1_raw)
@@ -517,7 +517,11 @@ class MarketDataHandler:
         df["time"] = pd.to_datetime(df[tcol], utc=True).dt.tz_localize(None)
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", 1000.0), errors="coerce").fillna(1000.0)
+        # [v8.2.1 FIX] guard volume
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+        else:
+            df["volume"] = 1000.0
         df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
         m15 = df.set_index("time").resample("15min").ffill().reset_index()
         m15["volume"] /= 4.0
@@ -664,7 +668,7 @@ def check_macro_correlation(cfg: BotConfig) -> Tuple[bool, str]:
 
 
 # ============================================================================
-# 10. SIGNAL GENERATOR (RSI fix)
+# 10. SIGNAL GENERATOR
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -707,40 +711,34 @@ class SignalGenerator:
         v: List[int] = []
         dbg: Dict[str, int] = {}
 
-        # 6 SMA — but 4 of them removed for non-redundancy
-        # [H2 partial] Use only 2 SMAs + 4 orthogonal factors
         sma_votes = [1 if c > sma(close, 50).iloc[-1] else -1,
                      1 if c > sma(close, 200).iloc[-1] else -1]
-        # Pad with 4 macro-style votes to keep 6-count (preserve 21 total)
         e9 = ema(close, 9); e21 = ema(close, 21)
         e50 = ema(close, 50); e200 = ema(close, 200)
         pad = [
             1 if e9.iloc[-1] > e21.iloc[-1] else -1,
             1 if e50.iloc[-1] > e200.iloc[-1] else -1,
-            1 if c > close.iloc[-24] else -1,    # daily momentum
-            1 if float(close.std()) < float(close.rolling(50).std().iloc[-1]) else -1,  # vol regime
+            1 if c > close.iloc[-24] else -1,
+            1 if float(close.std()) < float(close.rolling(50).std().iloc[-1]) else -1,
         ]
         v.extend(sma_votes + pad)
         dbg["trend"] = sum(sma_votes + pad)
 
-        # 3 EMA
         e1 = 1 if ema(close, 9).iloc[-1] > ema(close, 21).iloc[-1] else -1
         e2 = 1 if ema(close, 12).iloc[-1] > ema(close, 26).iloc[-1] else -1
         e3 = 1 if ema(close, 50).iloc[-1] > ema(close, 200).iloc[-1] else -1
         v.extend([e1, e2, e3])
         dbg["ema"] = e1 + e2 + e3
 
-        # [H1 FIX] RSI — symmetric
         r = float(rsi(close, 14).iloc[-1])
         r_v = [
-            1 if r > 55 else (-1 if r < 45 else 0),   # directional
-            -1 if r > 70 else (1 if r < 30 else 0),   # contrarian
-            1 if r > 50 else -1,                        # baseline
+            1 if r > 55 else (-1 if r < 45 else 0),
+            -1 if r > 70 else (1 if r < 30 else 0),
+            1 if r > 50 else -1,
         ]
         v.extend(r_v)
         dbg["rsi"] = sum(r_v)
 
-        # 5 momentum
         adx_v, p_di, m_di = adx(df, 14)
         m_v = [
             1 if p_di.iloc[-1] > m_di.iloc[-1] else -1,
@@ -752,7 +750,6 @@ class SignalGenerator:
         v.extend(m_v)
         dbg["momentum"] = sum(m_v)
 
-        # 2 micro
         mp = 0
         for n in (5, 10):
             hi_n, lo_n = df["high"].iloc[-n:].max(), df["low"].iloc[-n:].min()
@@ -762,13 +759,11 @@ class SignalGenerator:
             mp += vote
         dbg["micro"] = mp
 
-        # 1 volume
         vol_ma = df["volume"].rolling(20).mean().iloc[-1]
         vol_v = 1 if (not pd.isna(vol_ma) and df["volume"].iloc[-1] > vol_ma) else -1
         v.append(vol_v)
         dbg["volume"] = vol_v
 
-        # 1 POC
         poc = volume_profile_poc(df)
         poc_v = 1 if c > poc else -1
         v.append(poc_v)
@@ -906,7 +901,7 @@ class AuditDB:
             ("status", "TEXT DEFAULT 'OPEN'"), ("r_multiple", "REAL"),
             ("closed_at", "TEXT"), ("closed_price", "REAL"),
             ("max_hold_hours", "REAL DEFAULT 48"),
-            ("confirmed", "INTEGER DEFAULT 0"),     # 0=unknown, 1=taken, 2=skipped
+            ("confirmed", "INTEGER DEFAULT 0"),
             ("confirm_ts", "TEXT"),
             ("pnl_usd", "REAL"),
         ]
@@ -1152,7 +1147,6 @@ class AuditDB:
         age = (datetime.now(timezone.utc) - ts).total_seconds() / 60
         return age < cooldown and a == action and abs(sp - spot) < tol
 
-    # meta
     def get_meta(self, key: str) -> Optional[str]:
         if not self.ok:
             return None
@@ -1177,7 +1171,7 @@ class AuditDB:
 
 
 # ============================================================================
-# 12. RISK ENGINE (with $ DD + exposure caps)
+# 12. RISK ENGINE
 # ============================================================================
 class RiskManagementEngine:
     def __init__(self, cfg: BotConfig, db: AuditDB):
@@ -1213,11 +1207,9 @@ class RiskManagementEngine:
     def _daily_dd_multiplier(self) -> Tuple[float, str]:
         today_r = self.db.get_today_r_sum()
         today_pnl = self.db.get_today_pnl_usd()
-        # $ HALT (hard)
         pnl_limit = -self.cfg.account_size_usd * self.cfg.daily_dd_pct_limit / 100.0
         if today_pnl <= pnl_limit:
             return 0.0, f"DAILY_PNL_HALT (${today_pnl:.0f} ≤ ${pnl_limit:.0f})"
-        # R HALT (soft, complementary)
         if today_r <= -self.cfg.daily_dd_limit_r:
             return 0.0, f"DAILY_DD_HALT ({today_r:+.2f}R)"
         if today_r <= -self.cfg.daily_dd_derisk_r:
@@ -1286,7 +1278,7 @@ class RiskManagementEngine:
 
 
 # ============================================================================
-# 13. OUTCOME TRACKER (confirmed-only in live)
+# 13. OUTCOME TRACKER
 # ============================================================================
 class OutcomeTracker:
     def __init__(self, db: AuditDB, cfg: BotConfig):
@@ -1328,7 +1320,6 @@ class OutcomeTracker:
         return d
 
     def process(self, df_h1: pd.DataFrame) -> int:
-        # [C2] only process confirmed=1
         open_sigs = self.db.get_open_signals(confirmed_only=True)
         if not open_sigs:
             return 0
@@ -1521,7 +1512,7 @@ class TradingBotOrchestrator:
         self.outcomes = OutcomeTracker(self.db, cfg)
         self.tg = TelegramNotifier(cfg)
 
-    def _maybe_heartbeat(self) -> None:
+    def _maybe_heartbeat(self, source: str = "?") -> None:
         try:
             last = self.db.get_meta("last_heartbeat_ts")
             if last:
@@ -1535,12 +1526,12 @@ class TradingBotOrchestrator:
                 "today_r": self.db.get_today_r_sum(),
                 "today_pnl": self.db.get_today_pnl_usd(),
                 "kelly_pct": self.risk.kelly_risk_pct()[0],
-                "source": "?",  # filled below
+                "source": source,
             }
             self.tg.send_heartbeat(stats)
             self.db.set_meta("last_heartbeat_ts",
                               _to_utc_iso(datetime.now(timezone.utc)))
-            log_event(event="heartbeat_sent")
+            log_event(event="heartbeat_sent", source=source)
         except Exception as e:
             log_event(logging.WARNING, "heartbeat_fail", err=str(e)[:120])
 
@@ -1565,13 +1556,11 @@ class TradingBotOrchestrator:
             print(f"ACTION: ERROR — {err}")
             return 1
 
-        # Auto-skip stale unconfirmed (live mode)
         if self.cfg.trading_mode == "live":
             n_skip = self.db.auto_skip_stale(self.cfg.auto_confirm_hours)
             if n_skip:
                 log_event(event="auto_skipped_stale", count=n_skip)
 
-        # Outcome resolution
         try:
             n_closed = self.outcomes.process(md.h1)
             if n_closed:
@@ -1585,30 +1574,27 @@ class TradingBotOrchestrator:
             basis = self.data.get_basis(md)
             tradable = float(md.h1["close"].iloc[-1]) + basis
 
-            # Risk gates
             mult, cb_r, dd_r = self.risk.combined_multiplier()
             if mult == 0.0:
                 log_event(event="risk_halt", cb=cb_r, dd=dd_r)
                 self.tg.send_signal(e, tradable, None)
                 print(f"ACTION: HALT — CB:{cb_r} | DD:{dd_r}")
-                self._maybe_heartbeat()
+                self._maybe_heartbeat(md.source)
                 return 0
 
-            # [C4] Exposure gate
             exposure_ok, exposure_reason = self.risk.exposure_gate(e.action)
             if e.action in ("BUY", "SELL") and not exposure_ok:
                 log_event(event="exposure_blocked", action=e.action,
                           reason=exposure_reason)
                 print(f"ACTION: {e.action} BLOCKED — {exposure_reason}")
-                self._maybe_heartbeat()
+                self._maybe_heartbeat(md.source)
                 return 0
 
-            # Daily signal limit
             n_today = self.db.count_today_signals()
             if n_today >= self.cfg.max_daily_signals:
                 log_event(event="daily_limit", n=n_today, max=self.cfg.max_daily_signals)
                 print(f"ACTION: SKIP — daily limit ({n_today}/{self.cfg.max_daily_signals})")
-                self._maybe_heartbeat()
+                self._maybe_heartbeat(md.source)
                 return 0
 
             kelly_base, kelly_reason = self.risk.kelly_risk_pct()
@@ -1623,7 +1609,7 @@ class TradingBotOrchestrator:
             if levels and self.db.is_dup(self.cfg.signal_cooldown_min, e.action, tradable):
                 log_event(event="signal_deduped", action=e.action, spot=round(tradable, 2))
                 print(f"ACTION: {e.action} (deduped) | Score: {e.total_score}%")
-                self._maybe_heartbeat()
+                self._maybe_heartbeat(md.source)
                 return 0
 
             signal_id = None
@@ -1653,7 +1639,7 @@ class TradingBotOrchestrator:
                   f"Regime: {e.regime} | Kelly: {kelly_final:.2f}% (×{mult}) | "
                   f"Spot: {tradable:.2f} | TG: {sent} | CB: {cb_r} | DD: {dd_r} | "
                   f"Today: {n_today}/{self.cfg.max_daily_signals} | Mode: {self.cfg.trading_mode}")
-            self._maybe_heartbeat()
+            self._maybe_heartbeat(md.source)
             return 0
         except Exception as ex:
             err = f"{type(ex).__name__}: {ex}"
