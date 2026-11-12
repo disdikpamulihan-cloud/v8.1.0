@@ -692,5 +692,16 @@ class TradingBotOrchestrator:
                           json={"chat_id": self.cfg.telegram_chat_id, "text": msg, "parse_mode": "HTML"})
         return 0
 
+# ============================================================================
+# 9. MAIN ENTRY POINT
+# ============================================================================
+def main() -> int:
+    try:
+        cfg = BotConfig.from_env()
+        return TradingBotOrchestrator(cfg).run()
+    except Exception as e:
+        print(f"ACTION: FATAL ERROR — {e}")
+        return 1
+
 if __name__ == "__main__":
-    sys.exit(TradingBotOrchestrator(BotConfig.from_env()).run())
+    sys.exit(main())
