@@ -1,8 +1,8 @@
-name: XAUUSD Signal Bot v8.2
+name: XAUUSD Signal Bot v9.1
 
 on:
   schedule:
-    - cron: '*/10 * * * *'      # 10-min cron: faster than 20-min, within TD quota
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -18,47 +18,54 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - run: pip install --no-cache-dir --quiet -r requirements.txt
+      - name: Install dependencies
+        run: pip install --no-cache-dir --quiet -r requirements.txt
 
       - name: Verify required files
         run: |
           MISSING=""
-          for f in bot.py optimizer.py news_calendar.py fuzzy_regime.py \
-                   kelly.py supabase_client.py confirm.py requirements.txt; do
-            [ ! -f "$f" ] && { echo "❌ MISSING: $f"; MISSING="$MISSING $f"; }
+          for f in bot.py requirements.txt; do
+            if [ ! -f "$f" ]; then
+              echo "❌ MISSING: $f"
+              MISSING="$MISSING $f"
+            else
+              echo "✅ $f"
+            fi
           done
-          [ -n "$MISSING" ] && exit 1 || true
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "❌ MISSING FILES:$MISSING"
+            exit 1
+          fi
 
-      - name: Verify imports
+      - name: Verify imports (Single-File Architecture)
         run: |
           python -c "
           import sys
           try:
-              from bot import main, is_holiday, is_market_open, VERSION
-              from news_calendar import NewsResult, check_news_guard
-              from fuzzy_regime import membership, blend_params, dominant
-              from kelly import kelly_fraction, risk_pct_from_env
-              from supabase_client import SUPABASE, try_insert_signal
-              from confirm import main as confirm_main
-              print(f'✅ v{VERSION} | Supabase={SUPABASE.enabled}')
+              from bot import main, VERSION
+              print(f'✅ Single-File Architecture OK | Version: {VERSION}')
           except Exception as e:
-              print(f'❌ {type(e).__name__}: {e}'); sys.exit(1)
+              print(f'❌ Import failed: {type(e).__name__}: {e}')
+              sys.exit(1)
           "
 
-      - name: Restore cache
+      - name: Restore persistent cache (SQLite audit DB)
         uses: actions/cache/restore@v4
         with:
           path: |
             data/quant_audit.db
-            data/news_cache.json
-            params.json
           key: bot-cache-${{ github.run_id }}
-          restore-keys: bot-cache-
+          restore-keys: |
+            bot-cache-
 
       - name: Run signal bot
         env:
@@ -70,30 +77,17 @@ jobs:
           ACCOUNT_SIZE_USD:     ${{ vars.ACCOUNT_SIZE_USD || '10000' }}
           XAUUSD_CONTRACT_SIZE: ${{ vars.XAUUSD_CONTRACT_SIZE || '100' }}
           RISK_PCT:             ${{ vars.RISK_PCT || '1.0' }}
-          KELLY_FRACTION:       ${{ vars.KELLY_FRACTION || '0.5' }}
-          KELLY_CAP_PCT:        ${{ vars.KELLY_CAP_PCT || '3.0' }}
           TRADING_MODE:         ${{ vars.TRADING_MODE || 'paper' }}
-          DAILY_DD_LIMIT_R:     ${{ vars.DAILY_DD_LIMIT_R || '3.0' }}
-          DAILY_DD_DERISK_R:    ${{ vars.DAILY_DD_DERISK_R || '2.0' }}
-          DAILY_DD_DERISK_MULT: ${{ vars.DAILY_DD_DERISK_MULT || '0.5' }}
           DAILY_DD_PCT_LIMIT:   ${{ vars.DAILY_DD_PCT_LIMIT || '3.0' }}
-          CB_HALT_CONSECUTIVE:  ${{ vars.CB_HALT_CONSECUTIVE || '5' }}
-          MAX_DAILY_SIGNALS:    ${{ vars.MAX_DAILY_SIGNALS || '10' }}
           MAX_CONCURRENT_PER_DIRECTION: ${{ vars.MAX_CONCURRENT_PER_DIRECTION || '2' }}
           MAX_TOTAL_OPEN_RISK_PCT:      ${{ vars.MAX_TOTAL_OPEN_RISK_PCT || '3.0' }}
-          AUTO_CONFIRM_HOURS:   ${{ vars.AUTO_CONFIRM_HOURS || '4' }}
           NEWS_ENABLED:         ${{ vars.NEWS_ENABLED || '1' }}
-          NEWS_CURRENCIES:      ${{ vars.NEWS_CURRENCIES || 'USD' }}
-          MACRO_DXY_VETO_PCT:   ${{ vars.MACRO_DXY_VETO_PCT || '0.40' }}
-          MACRO_10Y_VETO_PCT:   ${{ vars.MACRO_10Y_VETO_PCT || '1.50' }}
         run: python bot.py
 
-      - name: Save cache
+      - name: Save persistent cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
             data/quant_audit.db
-            data/news_cache.json
-            params.json
           key: bot-cache-${{ github.run_id }}
